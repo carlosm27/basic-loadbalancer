@@ -1,13 +1,41 @@
 use async_trait::async_trait;
 use pingora::prelude::*;
-use std::sync::Arc;
+
+use pingora_core::services::background::background_service;
+use std::{sync::Arc, time::Duration};
 
 use pingora_load_balancing::{selection::RoundRobin, LoadBalancer};
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
 use pingora_proxy::{ProxyHttp, Session};
 
+use once_cell::sync::Lazy;
+use pingora_limits::rate::Rate;
+
 pub struct LB(Arc<LoadBalancer<RoundRobin>>);
+
+impl LB {
+    pub fn get_request_appid(&self, session: &mut Session) -> Option<String> {
+        match session
+            .req_header()
+            .headers
+            .get("appid")
+            .map(|v| v.to_str())
+
+        {
+            None => None,
+            Some(v) => match v {
+                Ok(v) => Some(v.to_string()),
+                Err(_) => None,
+            },
+        }    
+    }
+}
+
+static RATE_LIMITER: Lazy<Rate> = Lazy::new(|| Rate::new(Duration::from_secs(1)));
+
+static MAX_REQ_PER_SEC: isize = 1;
+
 
 #[async_trait]
 impl ProxyHttp for LB {
@@ -45,11 +73,21 @@ fn main() {
     let mut my_server = Server::new(None).unwrap();
     my_server.bootstrap();
 
-    let upstream =
-        LoadBalancer::try_from_iter(["1.1.1.1:443", "1.0.0.1:443"]).unwrap();
+    let mut upstreams =
+        LoadBalancer::try_from_iter(["1.1.1.1:443", "1.0.0.1:443", 
+        "127.0.0.1:343"]).unwrap();  
 
-    let mut lb = http_proxy_service(&my_server.configuration, LB(Arc::new(upstream)));
+    let hc = TcpHealthCheck::new();
+    upstreams.set_health_check(hc);
+    upstreams.health_check_frequency = Some(Duration::from_secs(1));
+
+    let background = background_service("health check", upstreams);
+    let upstreams = background.task();
+
+    let mut lb = http_proxy_service(&my_server.configuration, LB(upstreams));
     lb.add_tcp("0.0.0.0:6188");
+
+    my_server.add_service(background);
     
     my_server.add_service(lb);
     my_server.run_forever();
