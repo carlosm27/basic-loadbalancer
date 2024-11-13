@@ -8,6 +8,7 @@ use pingora_load_balancing::{selection::RoundRobin, LoadBalancer};
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
 use pingora_proxy::{ProxyHttp, Session};
+use pingora::http::ResponseHeader;
 
 use once_cell::sync::Lazy;
 use pingora_limits::rate::Rate;
@@ -65,6 +66,35 @@ impl ProxyHttp for LB {
         upstream_request.insert_header("Host", "one.one.one.one").unwrap();
         Ok(())
     }
+
+    async fn request_filter(&self, 
+        session: &mut Session,
+        _ctx: &mut Self::CTX) -> Result<bool>
+        where
+            Self::CTX: Send + Sync,
+        {
+            let appid = match self.get_request_appid(session) {
+                None => return Ok(false),
+                Some(addr) => addr,
+            };
+
+            let curr_window_request = RATE_LIMITER.observe(&appid, 1);
+            if curr_window_request > MAX_REQ_PER_SEC {
+                let mut header = ResponseHeader::build(429, None).unwrap();
+                header
+                    .insert_header("X-Rate-Limit-Limit", MAX_REQ_PER_SEC.to_string())
+                    .unwrap();
+                header.insert_header("X-Rate-Limit-Remaining", "0").unwrap();
+                header.insert_header("X-Rate-Limit-Reset", "1").unwrap();
+                session.set_keepalive(None);
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
+                return Ok(true);        
+            }
+            Ok(false)
+
+        }
 
 
 }
